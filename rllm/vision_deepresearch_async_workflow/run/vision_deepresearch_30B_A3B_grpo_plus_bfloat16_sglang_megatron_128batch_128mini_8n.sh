@@ -33,8 +33,8 @@ n_parallel_tasks=256
 n_parallel_tools=2048
 
 # ========= length =========
-max_prompt_length=64000
-max_response_length=4096
+max_prompt_length=4096
+max_response_length=70000
 
 use_dynamic_bsz=True
 actor_ppo_max_token_len_per_gpu=70000
