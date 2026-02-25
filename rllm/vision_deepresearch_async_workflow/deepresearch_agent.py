@@ -17,6 +17,8 @@ from rllm.engine.rollout import RolloutEngine
 OBS_START = "<tool_response>"
 OBS_END = "\n</tool_response>"
 MAX_LLM_CALL_PER_RUN = 50
+MAX_PROMPT_LENGTH_PER_RUN = 64000
+MAX_RESPONSE_LENGTH_PER_RUN = 4096
 
 DEEPRESEARCH_SYSTEM_PROMPT_TEXT = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
@@ -215,50 +217,8 @@ class MultiTurnReactAgent:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
-        # Auto-detect context limit based on model capabilities
-        # Maintain explicit prompt/response budgets to stay aligned with rollout engine enforcement
-        self.max_prompt_tokens, self.max_response_tokens, self.max_context_tokens = (
-            self._get_model_context_limits(rollout_engine)
-        )
-
-    def _get_model_context_limits(self, rollout_engine) -> tuple[int, int, int]:
-        """Infer prompt/response/context budgets from rollout engine configuration."""
-        default_prompt = 2048
-        default_response = 2048
-
-        max_prompt = default_prompt
-        max_response = default_response
-
-        config = rollout_engine.config if hasattr(rollout_engine, "config") else None
-        data_cfg = (
-            config.data if config is not None and hasattr(config, "data") else None
-        )
-
-        if data_cfg is not None:
-            if hasattr(data_cfg, "max_prompt_length") and data_cfg.max_prompt_length:
-                max_prompt = int(data_cfg.max_prompt_length)
-            if (
-                hasattr(data_cfg, "max_response_length")
-                and data_cfg.max_response_length
-            ):
-                max_response = int(data_cfg.max_response_length)
-
-        if (
-            hasattr(rollout_engine, "max_prompt_length")
-            and rollout_engine.max_prompt_length
-        ):
-            max_prompt = int(rollout_engine.max_prompt_length)
-        if (
-            hasattr(rollout_engine, "max_response_length")
-            and rollout_engine.max_response_length
-        ):
-            max_response = int(rollout_engine.max_response_length)
-
-        # Ensure positive values
-        max_prompt = max(max_prompt, 1)
-        max_response = max(max_response, 1)
-
-        return max_prompt, max_response, max_prompt + max_response
+        self.max_prompt_tokens = MAX_PROMPT_LENGTH_PER_RUN
+        self.max_response_tokens = MAX_RESPONSE_LENGTH_PER_RUN
 
     def sanity_check_output(self, content: str) -> bool:
         """Check if the model output contains the expected thinking structure."""
@@ -269,6 +229,14 @@ class MultiTurnReactAgent:
     ):
         """Call rollout engine once; assumes XML ReAct format."""
         try:
+            # Force per-round limits from DeepResearchAgent without local token estimation.
+            if hasattr(self.rollout_engine, "max_prompt_length"):
+                self.rollout_engine.max_prompt_length = int(self.max_prompt_tokens)
+            if hasattr(self.rollout_engine, "max_response_length"):
+                self.rollout_engine.max_response_length = int(self.max_response_tokens)
+
+            kwargs.pop("max_new_tokens", None)
+            kwargs["max_tokens"] = int(self.max_response_tokens)
             response = await self.rollout_engine.get_model_response(
                 messages=messages, **kwargs
             )

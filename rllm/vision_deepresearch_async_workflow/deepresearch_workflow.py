@@ -289,9 +289,9 @@ class DeepResearchWorkflow(Workflow):
                         continue
                     trajectory.reward = outcome_reward
 
-                    last_step = trajectory.steps[-1]
-                    last_step.reward = trajectory.reward
-                    trajectory.steps = [last_step]
+                    # last_step = trajectory.steps[-1]
+                    # last_step.reward = trajectory.reward
+                    # trajectory.steps = [last_step]
 
                 episode.metrics = {
                     "reward/outcome": outcome_reward,
