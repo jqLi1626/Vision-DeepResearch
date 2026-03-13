@@ -43,7 +43,7 @@ def run_with_retries(func: Callable[[], T], attempts: int = 5, delay: float = 0.
             log_tool_event(
                 "Retry",
                 "AttemptFailed",
-                f"Attempt {attempt}/{attempts} failed, will retry",
+                f"Attempt {attempt}/{attempts} failed, will retry: {type(exc).__name__}: {str(exc)[:200]}",
                 level="WARNING",
             )
             if delay > 0:
@@ -83,7 +83,7 @@ async def run_with_retries_async(
             log_tool_event(
                 "Retry",
                 "AttemptFailed",
-                f"Attempt {attempt}/{attempts} failed, will retry",
+                f"Attempt {attempt}/{attempts} failed, will retry: {type(exc).__name__}: {str(exc)[:200]}",
                 level="WARNING",
             )
             if delay > 0:
@@ -556,16 +556,28 @@ class DeepResearchTool(RLLMTool, ABC):
         self.executor = executor
 
     def _get_requests_proxies(self) -> dict | None:
-        """Build requests-compatible proxy mapping from TOOL_HTTPS_PROXY."""
+        """Build requests-compatible proxy mapping from TOOL_HTTPS_PROXY.
+
+        Only HTTPS traffic is proxied. All external services (OSS, Serper,
+        Reader) use HTTPS. Local services (extract model on port 8002) use
+        plain HTTP and are never proxied.
+
+        Note: requests' merge_setting() strips None-valued proxy keys, so the
+        "http://localhost": None bypass pattern does NOT work. The correct fix
+        is to simply omit the "http" key entirely.
+        """
         proxy_value = os.getenv("TOOL_HTTPS_PROXY")
         if proxy_value is None:
             return None
 
         proxy_value = proxy_value.strip()
         if not proxy_value or proxy_value.lower() == "none":
-            return {"http": None, "https": None}
+            return {"https": None}
 
-        return {"http": proxy_value, "https": proxy_value}
+        return {
+            # Only proxy HTTPS traffic; HTTP traffic goes direct (local services)
+            "https": proxy_value,
+        }
 
     async def _run_blocking(self, func: Callable[[], T]) -> T:
         """Run a blocking function in the bound executor."""
@@ -674,6 +686,31 @@ async def initialize_cache_async():
 # Cache initialization flag
 _cache_initialized = False
 _cache_init_lock = asyncio.Lock()
+
+
+# ============================================================================
+# Jina Reader concurrency limiter
+# ============================================================================
+
+# Maximum number of simultaneous requests to r.jina.ai (avoids rate limiting /
+# pool exhaustion).  Override with env var JINA_MAX_CONCURRENCY.
+_JINA_MAX_CONCURRENCY: int = int(os.getenv("JINA_MAX_CONCURRENCY", "5"))
+_jina_semaphore: Optional["asyncio.Semaphore"] = None
+_jina_semaphore_lock = asyncio.Lock()
+
+
+async def get_jina_semaphore() -> "asyncio.Semaphore":
+    """Return the global asyncio.Semaphore for Jina Reader concurrency limiting."""
+    global _jina_semaphore
+    if _jina_semaphore is None:
+        async with _jina_semaphore_lock:
+            if _jina_semaphore is None:
+                _jina_semaphore = asyncio.Semaphore(_JINA_MAX_CONCURRENCY)
+    return _jina_semaphore
+
+
+# Backward-compatibility alias
+get_succ_semaphore = get_jina_semaphore
 
 
 async def ensure_cache_initialized():

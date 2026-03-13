@@ -44,17 +44,24 @@ T = TypeVar("T")
 
 
 def _get_requests_proxies() -> dict[str, str | None] | None:
-    """Build requests-compatible proxy mapping from TOOL_HTTPS_PROXY."""
+    """Build requests-compatible proxy mapping from TOOL_HTTPS_PROXY.
 
+    Only HTTPS traffic is proxied. requests' merge_setting() strips None-valued
+    proxy keys, so "http://localhost": None bypass does NOT work. Omit "http"
+    entirely so local services (judge/extract on port 8002) go direct.
+    """
     proxy_value = os.getenv("TOOL_HTTPS_PROXY")
     if proxy_value is None:
         return None
 
     proxy_value = proxy_value.strip()
     if not proxy_value or proxy_value.lower() == "none":
-        return {"http": None, "https": None}
+        return {"https": None}
 
-    return {"http": proxy_value, "https": proxy_value}
+    return {
+        # Only proxy HTTPS; HTTP traffic (local judge/extract) goes direct
+        "https": proxy_value,
+    }
 
 
 def _run_with_retries_sync(
@@ -168,7 +175,12 @@ class RewardDeepResearchFn:
 
         # http client (sync)
         self._client: httpx.Client | None = None
-        self._judge_proxies = _get_requests_proxies()
+        _proxies = _get_requests_proxies()
+        # Never proxy local judge endpoints (localhost / 127.0.0.1)
+        _judge_endpoint = self.vllm_url or self.base_url or ""
+        if _proxies and any(h in _judge_endpoint for h in ["localhost", "127.0.0.1", "::1"]):
+            _proxies = None
+        self._judge_proxies = _proxies
         self.judge_retry_attempts = int(os.getenv("JUDGE_RETRY_ATTEMPTS", "3"))
         self.judge_retry_delay = float(os.getenv("JUDGE_RETRY_DELAY", "1.0"))
         self.judge_timeout = float(os.getenv("JUDGE_TIMEOUT", "300"))

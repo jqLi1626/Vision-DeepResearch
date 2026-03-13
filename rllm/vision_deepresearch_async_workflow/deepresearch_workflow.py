@@ -5,7 +5,10 @@ from typing import Any, List, Optional
 
 from PIL import Image
 
-from vision_deepresearch_async_workflow.deepresearch_agent import DeepResearchAgent
+from vision_deepresearch_async_workflow.deepresearch_agent import (
+    DeepResearchAgent,
+    PlannerExecutorReActAgent,
+)
 from rllm.agents.agent import Action, Episode, Step, Trajectory
 from rllm.engine.rollout import RolloutEngine
 from rllm.rewards.reward_fn import RewardFunction
@@ -188,6 +191,7 @@ class DeepResearchWorkflow(Workflow):
         tools: dict | None = None,
         system_prompt: str | None = None,
         reward_function: RewardFunction | None = None,
+        max_llm_calls: int | None = None,
         **kwargs,
     ):
         super().__init__(rollout_engine, executor, **kwargs)
@@ -199,10 +203,15 @@ class DeepResearchWorkflow(Workflow):
         self.system_prompt = system_prompt
         self.reward_function = reward_function
 
+        agent_kwargs = {}
+        if max_llm_calls is not None:
+            agent_kwargs["max_llm_calls"] = max_llm_calls
+
         self.agent = DeepResearchAgent(
             rollout_engine=rollout_engine,
             tools=self.tools,
             system_prompt=self.system_prompt,
+            **agent_kwargs,
         )
 
     async def run(self, task: dict, uid: str, **kwargs) -> Episode:
@@ -390,4 +399,57 @@ class DeepResearchWorkflow(Workflow):
         return True
 
 
-__all__ = ["DeepResearchWorkflow"]
+class PlannerExecutorDeepResearchWorkflow(DeepResearchWorkflow):
+    """
+    Variant of DeepResearchWorkflow that uses the Planner-Executor two-model architecture.
+
+    The planner_engine (large model) handles all reasoning (<think> blocks),
+    while the executor_engine (small trained model) generates precise tool calls
+    and bbox coordinates.
+
+    Constructor accepts all DeepResearchWorkflow kwargs plus:
+        executor_engine: RolloutEngine  — the small executor model engine
+    """
+
+    def __init__(
+        self,
+        rollout_engine: RolloutEngine,
+        executor,
+        executor_engine: RolloutEngine | None = None,
+        tools: dict | None = None,
+        system_prompt: str | None = None,
+        reward_function: RewardFunction | None = None,
+        max_llm_calls: int | None = None,
+        **kwargs,
+    ):
+        # Call grandparent (Workflow.__init__) directly to avoid creating the
+        # wrong agent type in DeepResearchWorkflow.__init__
+        from rllm.workflows.workflow import Workflow
+        Workflow.__init__(self, rollout_engine, executor, **kwargs)
+
+        self.tools = tools or {}
+        for tool in self.tools.values():
+            if hasattr(tool, "set_executor"):
+                tool.set_executor(self.executor)
+        self.system_prompt = system_prompt
+        self.reward_function = reward_function
+
+        if executor_engine is None:
+            raise ValueError(
+                "PlannerExecutorDeepResearchWorkflow requires an `executor_engine`. "
+                "Pass the small model's RolloutEngine as executor_engine=..."
+            )
+
+        agent_kwargs = {}
+        if max_llm_calls is not None:
+            agent_kwargs["max_llm_calls"] = max_llm_calls
+
+        self.agent = PlannerExecutorReActAgent(
+            planner_engine=rollout_engine,
+            executor_engine=executor_engine,
+            tools=self.tools,
+            **agent_kwargs,
+        )
+
+
+__all__ = ["DeepResearchWorkflow", "PlannerExecutorDeepResearchWorkflow"]

@@ -10,6 +10,7 @@ from vision_deepresearch_async_workflow.tools.shared import (
     DeepResearchTool,
     get_cache_async,
     get_cache_key,
+    get_jina_semaphore,
     log_tool_event,
     run_with_retries_async,
     set_cache_async,
@@ -75,21 +76,15 @@ class CropAndSearchTool(DeepResearchTool):
         self.oss_access_key_secret = os.getenv("OSS_ACCESS_KEY_SECRET")
         self.oss_endpoint = os.getenv("OSS_ENDPOINT")
         self.oss_bucket_name = os.getenv("OSS_BUCKET_NAME")
+        self.serper_api_key = os.getenv("SERPER_API_KEY", "")
+        self.serper_lens_url = "https://google.serper.dev/lens"
+        # Zhipu API key is still used by the webpage reader (_fetch_reader_content)
         self.zhipu_api_key = os.getenv("ZHIPU_API_KEY")
-        self.jina_api_key = os.getenv("JINA_API_KEY")
-        self.serp_api_key = os.getenv("SERP_API_KEY")
-        self.zhipu_image_search_url = os.getenv(
-            "IMAGE_SEARCH_URL",
-            "https://search-svip.bigmodel.cn/api/paas/v4/image_search",
-        )
-        self.serp_image_search_url = os.getenv(
-            "IMAGE_SEARCH_URL",
-            "https://google.serper.dev/lens",
-        )
         self.zhipu_reader_url = os.getenv(
             "READER_URL", "https://search-svip.bigmodel.cn/api/paas/v4/reader"
         )
-        self.jina_reader_url = os.getenv("READER_URL", "https://r.jina.ai")
+        self.jina_reader_url = os.getenv("JINA_READER_URL", "https://r.jina.ai")
+        self.jina_api_key = os.getenv("JINA_API_KEY", "")
         self.extract_model = os.getenv("EXTRACT_MODEL", "Qwen3-VL-30B-A3B-Instruct")
         self.extract_max_tokens = 16384
         raw_extract_urls = os.getenv("EXTRACT_URL", "")
@@ -97,6 +92,8 @@ class CropAndSearchTool(DeepResearchTool):
             item.strip() for item in raw_extract_urls.split(",") if item.strip()
         ]
         self.image_crop_cache = os.getenv("IMAGE_CROP_CACHE", None)
+        _max_crops_env = os.getenv("MAX_CROPS_PER_CALL", "")
+        self.max_crops_per_call = int(_max_crops_env) if _max_crops_env.strip() else None
         self._oss_bucket = None
 
     def _get_oss_bucket(self):
@@ -179,6 +176,12 @@ class CropAndSearchTool(DeepResearchTool):
                 "http://", ""
             )
             public_url = f"https://{self.oss_bucket_name}.{endpoint_host}/{oss_path}"
+            log_tool_event(
+                "CropAndSearch",
+                "OSSUploadSuccess",
+                f"local_path={local_path} oss_url={public_url}",
+                level="INFO",
+            )
             return public_url
 
         except Exception as e:
@@ -186,7 +189,7 @@ class CropAndSearchTool(DeepResearchTool):
             return None
 
     async def _image_search(self, oss_url: str) -> Optional[List[Dict[str, str]]]:
-        """Perform image search using Zhipu or Serp API."""
+        """Perform image search using Serper Lens API (google.serper.dev/lens)."""
         # Check cache first
         cache_key = get_cache_key(oss_url)
         cached_result = await get_cache_async(
@@ -198,11 +201,7 @@ class CropAndSearchTool(DeepResearchTool):
             except json.JSONDecodeError:
                 pass  # Continue with API call if cache is corrupted
 
-        final_result = None
-        if self.zhipu_api_key:
-            final_result = await self._image_search_with_zhipu(oss_url)
-        else:
-            final_result = await self._image_search_with_serp(oss_url)
+        final_result = await self._image_search_with_serper_lens(oss_url)
 
         # Store result in cache
         if final_result is not None:
@@ -216,27 +215,25 @@ class CropAndSearchTool(DeepResearchTool):
 
         return final_result
 
-    async def _image_search_with_zhipu(
+    async def _image_search_with_serper_lens(
         self, oss_url: str
     ) -> Optional[List[Dict[str, str]]]:
+        """Use google.serper.dev/lens for reverse image search via direct HTTP POST."""
         headers = {
-            "Authorization": self.zhipu_api_key,
+            "X-API-KEY": self.serper_api_key,
             "Content-Type": "application/json",
-            "Accept": "*/*",
         }
         payload = {"url": oss_url}
         proxies = self._get_requests_proxies()
 
         def make_search_request():
-            response = requests.post(
-                self.zhipu_image_search_url,
+            return requests.post(
+                self.serper_lens_url,
                 headers=headers,
                 json=payload,
                 timeout=30,
                 proxies=proxies,
             )
-            response.raise_for_status()
-            return response
 
         try:
             response = await run_with_retries_async(
@@ -244,79 +241,38 @@ class CropAndSearchTool(DeepResearchTool):
                 executor=self.executor,
             )
 
-            result_data = response.json()
-            search_results = result_data.get("search_result", [])
-
-            formatted_results = []
-            for item in search_results[: self.MAX_URLS]:  # Take top 3
-                title = item.get("title", "Untitled")
-                image_url = item.get("image_url", "")
-                link = item.get("link", "")
-                source = item.get("source", "")
-                thumbnail_url = item.get("thumbnail_url", "")
-
-                if image_url and link:
-                    formatted_results.append(
-                        {
-                            "title": title,
-                            "image_url": image_url,
-                            "link": link,
-                            "bbox_image_url": oss_url,
-                            "source": source,
-                            "thumbnail_url": thumbnail_url,
-                        }
-                    )
-
-            return formatted_results if formatted_results else None
-
-        except Exception as e:
-            log_tool_event(
-                "CropAndSearch",
-                "SearchError",
-                f"provider=zhipu url={oss_url} error={str(e)}",
-                level="ERROR",
-            )
-            return None
-
-    async def _image_search_with_serp(
-        self, oss_url: str
-    ) -> Optional[List[Dict[str, str]]]:
-        headers = {
-            "X-API-KEY": self.serp_api_key,
-            "Content-Type": "application/json",
-        }
-        payload = {"url": oss_url}
-        proxies = self._get_requests_proxies()
-
-        def make_search_request():
-            response = requests.post(
-                self.serp_image_search_url,
-                headers=headers,
-                json=payload,
-                timeout=30,
-                proxies=proxies,
-            )
-            response.raise_for_status()
-            return response
-
-        try:
-            response = await run_with_retries_async(
-                func=make_search_request,
-                executor=self.executor,
-            )
+            if response.status_code != 200:
+                log_tool_event(
+                    "CropAndSearch",
+                    "SearchError",
+                    f"provider=serper_lens url={oss_url} status={response.status_code} body={response.text[:200]}",
+                    level="ERROR",
+                )
+                return None
 
             result_data = response.json()
-            search_results = result_data.get("organic", [])
+
+            if isinstance(result_data, dict) and "error" in result_data:
+                log_tool_event(
+                    "CropAndSearch",
+                    "SearchError",
+                    f"provider=serper_lens url={oss_url} error={result_data['error']}",
+                    level="ERROR",
+                )
+                return None
+
+            # Serper Lens may return results in "visual_matches" or "organic"
+            search_results = result_data.get("visual_matches") or result_data.get("organic", [])
 
             formatted_results = []
-            for item in search_results[: self.MAX_URLS]:  # Take top 3
+            for item in search_results[: self.MAX_URLS]:
                 title = item.get("title", "Untitled")
-                image_url = item.get("imageUrl", "")
+                image_url = item.get("imageUrl", "") or item.get("thumbnailUrl", "")
                 link = item.get("link", "")
                 source = item.get("source", "")
                 thumbnail_url = item.get("thumbnailUrl", "")
 
-                if image_url and link:
+                if link:
                     formatted_results.append(
                         {
                             "title": title,
@@ -328,13 +284,20 @@ class CropAndSearchTool(DeepResearchTool):
                         }
                     )
 
+            if formatted_results:
+                log_tool_event(
+                    "CropAndSearch",
+                    "ImageSearchSuccess",
+                    f"oss_url={oss_url} results_count={len(formatted_results)}",
+                    level="INFO",
+                )
             return formatted_results if formatted_results else None
 
         except Exception as e:
             log_tool_event(
                 "CropAndSearch",
                 "SearchError",
-                f"provider=serp url={oss_url} error={str(e)}",
+                f"provider=serper_lens url={oss_url} error={str(e)}",
                 level="ERROR",
             )
             return None
@@ -343,7 +306,11 @@ class CropAndSearchTool(DeepResearchTool):
     # Webpage visiting functions (moved from visit_summary_vl.py)
     # ============================================================================
 
+    @staticmethod
     def get_num_bytes(base64_str):
+        # Strip data URI prefix if present (e.g. "data:image/jpeg;base64,...")
+        if ";base64," in base64_str:
+            base64_str = base64_str.split(";base64,", 1)[1]
         # Ensure base64 padding is correct.
         padding = 4 - len(base64_str) % 4
         if padding < 4:
@@ -776,7 +743,7 @@ Example:
 
         # Fallback to text-only
         return await self._summarize_with_extract_only_text(
-            content, goal, reader_payload
+            content, goal
         )
 
     async def _fetch_reader_content(self, url: str) -> Optional[Dict[str, Any]]:
@@ -841,23 +808,67 @@ Example:
                     "meta": data,
                 }
             else:
-                headers = {"Authorization": self.jina_api_key}
-                body = {"url": url}
+                # Jina Reader API: GET https://r.jina.ai/<目标URL>
+                # Uses a shared semaphore to cap concurrency and retries on HTTP 429/503
+                # with exponential back-off.
+                jina_url = self.jina_reader_url.rstrip("/") + "/" + url
+                _max_retries = int(os.getenv("JINA_MAX_RETRIES", "3"))
+                sem = await get_jina_semaphore()
+                response = None
 
-                def send_request():
-                    return requests.post(
-                        self.jina_reader_url,
-                        headers=headers,
-                        data=body,
-                        timeout=30,
-                        proxies=proxies,
+                jina_headers = {"Accept": "text/plain"}
+                if self.jina_api_key:
+                    jina_headers["Authorization"] = f"Bearer {self.jina_api_key}"
+
+                for _attempt in range(_max_retries):
+                    async with sem:
+                        try:
+                            _captured = jina_url  # avoid late-binding in lambda
+                            _captured_headers = jina_headers
+                            response = await self._run_blocking(
+                                lambda: requests.get(
+                                    _captured,
+                                    headers=_captured_headers,
+                                    timeout=60,
+                                    proxies=proxies,
+                                )
+                            )
+                        except Exception as exc:
+                            _wait = 2 ** _attempt
+                            log_tool_event(
+                                "CropAndSearch",
+                                "JinaFetchRetry",
+                                f"url={url} attempt={_attempt + 1}/{_max_retries} "
+                                f"error={str(exc)[:120]} retry_in={_wait}s",
+                                level="WARNING",
+                            )
+                            if _attempt < _max_retries - 1:
+                                await asyncio.sleep(_wait)
+                            continue
+
+                    if response.status_code in (429, 503):
+                        _wait = 2 ** _attempt
+                        log_tool_event(
+                            "CropAndSearch",
+                            "JinaRateLimitRetry",
+                            f"url={url} attempt={_attempt + 1}/{_max_retries} "
+                            f"status={response.status_code} retry_in={_wait}s",
+                            level="WARNING",
+                        )
+                        if _attempt < _max_retries - 1:
+                            await asyncio.sleep(_wait)
+                        continue
+
+                    break  # non-429/503 response — exit retry loop
+
+                if response is None or response.status_code != 200:
+                    log_tool_event(
+                        "CropAndSearch",
+                        "JinaFetchError",
+                        f"url={url} status={response.status_code if response else 'None'} "
+                        f"body={response.text[:200] if response else ''}",
+                        level="ERROR",
                     )
-
-                response = await run_with_retries_async(
-                    send_request, executor=self.executor
-                )
-
-                if response.status_code != 200:
                     return None
 
                 result = {
@@ -872,6 +883,20 @@ Example:
 
             # Store result in cache only if we have valid content
             if result["content"].strip():
+                content_len = len(result["content"])
+                log_tool_event(
+                    "CropAndSearch",
+                    "ReaderFetchSuccess",
+                    f"url={url} content_len={content_len}",
+                    level="INFO",
+                )
+                if content_len < 2000:
+                    log_tool_event(
+                        "CropAndSearch",
+                        "ShortContent",
+                        f"url={url} content_len={content_len} (may be low-quality)",
+                        level="WARNING",
+                    )
                 await set_cache_async(
                     "image_visit",
                     cache_key,
@@ -882,7 +907,13 @@ Example:
 
             return result
 
-        except Exception:
+        except Exception as e:
+            log_tool_event(
+                "CropAndSearch",
+                "JinaFetchException",
+                f"url={url} error={str(e)[:200]}",
+                level="ERROR",
+            )
             return None
 
     async def _handle_single_url(
@@ -961,6 +992,24 @@ Example:
     ) -> str:
         """Visit webpages for search results and extract relevant information."""
         try:
+            # Deduplicate by URL — same link may appear in multiple search results
+            seen_links: set = set()
+            deduped_results: List[Dict[str, str]] = []
+            for item in search_results:
+                link = item.get("link", "")
+                if not link:
+                    continue
+                if link in seen_links:
+                    log_tool_event(
+                        "CropAndSearch",
+                        "DuplicateURLSkipped",
+                        f"url={link}",
+                        level="WARNING",
+                    )
+                else:
+                    seen_links.add(link)
+                    deduped_results.append(item)
+
             # Create concurrent tasks for all webpage visits
             visit_tasks = [
                 self._handle_single_url(
@@ -972,7 +1021,7 @@ Example:
                     image_url=item["image_url"],
                     source=item["source"],
                 )
-                for item in search_results
+                for item in deduped_results
             ]
 
             # Execute all webpage visits concurrently
@@ -1105,6 +1154,16 @@ Example:
             else:
                 return "[CropAndSearch] Invalid bbox format"
 
+            # Limit the number of bboxes to process per call
+            if self.max_crops_per_call is not None and len(bbox_list) > self.max_crops_per_call:
+                log_tool_event(
+                    "CropAndSearch",
+                    "BboxLimited",
+                    f"total_bboxes={len(bbox_list)} max_crops_per_call={self.max_crops_per_call} keeping first {self.max_crops_per_call}",
+                    level="WARNING",
+                )
+                bbox_list = bbox_list[: self.max_crops_per_call]
+
             # Create concurrent tasks for all bboxes
             tasks = [
                 self._process_single_bbox(single_bbox, i, image_id, cache_dir, goal)
@@ -1131,7 +1190,7 @@ Example:
                     all_results.append(
                         f"Bbox {bbox_list[i]}: Task failed - {str(result)}"
                     )
-                elif isinstance(result, tuple) and len(result) == self.MAX_URLS:
+                elif isinstance(result, tuple) and len(result) == 3:
                     bbox_index, result_text, oss_url = result
                     all_results.append(result_text)
                     if oss_url:

@@ -9,9 +9,9 @@ Now supports both:
 - OpenAI native function calling (for o3, o3-mini, etc.)
 """
 
-import http.client
 import json
 import os
+import requests
 from abc import ABC, abstractmethod
 
 from rllm.tools.tool_base import Tool as RLLMTool
@@ -130,7 +130,7 @@ class SearchTool(DeepResearchTool):
 
     async def call(self, query: str | list, **kwargs) -> str:
         """
-        Search the web using Serper API or Google Custom Search.
+        Search the web using Serper API (google.serper.dev).
 
         Args:
             query: Search query string or list of queries
@@ -138,31 +138,7 @@ class SearchTool(DeepResearchTool):
         Returns:
             Formatted search results
         """
-        api_key = os.getenv("SERPER_API_KEY")
-
-        # Try Google Custom Search as fallback if no Serper key
-        if not api_key:
-            google_key = os.getenv("GOOGLE_SEARCH_SECRET_KEY")
-            google_engine_id = os.getenv("GOOGLE_SEARCH_ENGINE_ID")
-
-            if google_key and google_engine_id:
-                return self._google_search_fallback(query)
-
-            return f"""[Search - API Key Required]
-
-To enable real web search, use one of these options:
-
-Option 1 - Serper (Recommended, simpler):
-1. Get a free API key from https://serper.dev (2500 searches/month free)
-2. Add to .env: SERPER_API_KEY=your_key_here
-
-Option 2 - Google Custom Search:
-1. Set up at https://developers.google.com/custom-search
-2. Add to .env:
-   GOOGLE_SEARCH_SECRET_KEY=your_key
-   GOOGLE_SEARCH_ENGINE_ID=your_engine_id
-
-Placeholder results for '{query}'..."""
+        api_key = os.getenv("SERPER_API_KEY", "")
 
         # Handle single query or list
         queries = [query] if isinstance(query, str) else query
@@ -170,29 +146,25 @@ Placeholder results for '{query}'..."""
 
         for q in queries:
             try:
-                conn = http.client.HTTPSConnection("google.serper.dev")
+                headers = {
+                    "X-API-KEY": api_key,
+                    "Content-Type": "application/json",
+                }
 
-                # Localize for Chinese queries
                 if self.contains_chinese(q):
-                    payload = json.dumps({"q": q, "location": "China", "gl": "cn", "hl": "zh-cn"})
+                    payload = {"q": q, "location": "China", "gl": "cn", "hl": "zh-cn"}
                 else:
-                    payload = json.dumps({"q": q, "location": "United States", "gl": "us", "hl": "en"})
+                    payload = {"q": q, "location": "United States", "gl": "us", "hl": "en"}
 
-                headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
-
-                # Retry logic
-                for i in range(5):
-                    try:
-                        conn.request("POST", "/search", payload, headers)
-                        res = conn.getresponse()
-                        break
-                    except Exception:
-                        if i == 4:
-                            all_results.append(f"Google search timeout for '{q}'")
-                            continue
-
-                data = res.read()
-                results = json.loads(data.decode("utf-8"))
+                response = requests.request(
+                    "POST",
+                    "https://google.serper.dev/search",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                results = response.json()
 
                 if "organic" not in results:
                     all_results.append(f"No results found for '{q}'")
@@ -245,25 +217,25 @@ class ScholarTool(DeepResearchTool):
         Returns:
             Academic search results
         """
-        api_key = os.getenv("SERPER_API_KEY")
-        if not api_key:
-            return """[Scholar - API Key Required]
-
-To enable Google Scholar search, configure SERPER_API_KEY in your .env file."""
+        api_key = os.getenv("SERPER_API_KEY", "")
 
         queries = [query] if isinstance(query, str) else query
         all_results = []
 
         for q in queries:
             try:
-                conn = http.client.HTTPSConnection("google.serper.dev")
-                payload = json.dumps({"q": q, "type": "scholar", "num": 10})
                 headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+                payload = {"q": q, "type": "scholar", "num": 10}
 
-                conn.request("POST", "/scholar", payload, headers)
-                res = conn.getresponse()
-                data = res.read()
-                results = json.loads(data.decode("utf-8"))
+                response = requests.request(
+                    "POST",
+                    "https://google.serper.dev/scholar",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                results = response.json()
 
                 if "organic" not in results:
                     all_results.append(f"No scholar results for '{q}'")

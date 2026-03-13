@@ -9,6 +9,7 @@ from vision_deepresearch_async_workflow.tools.shared import (
     DeepResearchTool,
     get_cache_async,
     get_cache_key,
+    get_jina_semaphore,
     log_tool_event,
     run_with_retries_async,
     set_cache_async,
@@ -67,11 +68,11 @@ Example:
             },
         )
         self.zhipu_api_key = os.getenv("ZHIPU_API_KEY")
-        self.jina_api_key = os.getenv("JINA_API_KEY")
         self.zhipu_reader_url = os.getenv(
             "READER_URL", "https://search-svip.bigmodel.cn/api/paas/v4/reader"
         )
-        self.jina_reader_url = os.getenv("READER_URL", "https://r.jina.ai")
+        self.jina_reader_url = os.getenv("JINA_READER_URL", "https://r.jina.ai")
+        self.jina_api_key = os.getenv("JINA_API_KEY", "")
         self.extract_model = os.getenv("EXTRACT_MODEL", "Qwen3-VL-30B-A3B-Instruct")
         self.extract_max_tokens = 16384
         raw_extract_urls = os.getenv("EXTRACT_URL", "")
@@ -239,28 +240,66 @@ Example:
                 "meta": data,
             }
         else:
-            headers = {
-                "Authorization": self.jina_api_key,
-            }
-            body = {
-                "url": url,
-            }
+            # Jina Reader API: GET https://r.jina.ai/{target_url}
+            # Uses a shared semaphore to cap concurrency and retries on HTTP 429/503
+            # with exponential back-off.
+            jina_base = self.jina_reader_url.rstrip("/")
+            reader_url = f"{jina_base}/{url}"
+            _max_retries = int(os.getenv("JINA_MAX_RETRIES", "3"))
+            sem = await get_jina_semaphore()
+            response = None
 
-            def send_request():
-                return requests.post(
-                    self.jina_reader_url,
-                    headers=headers,
-                    data=body,
-                    timeout=60,
-                    proxies=proxies,
+            jina_headers = {"Accept": "text/plain"}
+            if self.jina_api_key:
+                jina_headers["Authorization"] = f"Bearer {self.jina_api_key}"
+
+            for _attempt in range(_max_retries):
+                async with sem:
+                    try:
+                        _captured_url = reader_url  # avoid late-binding in lambda
+                        _captured_headers = jina_headers
+                        response = await self._run_blocking(
+                            lambda: requests.get(
+                                _captured_url,
+                                headers=_captured_headers,
+                                timeout=60,
+                                proxies=proxies,
+                            )
+                        )
+                    except Exception as exc:
+                        _wait = 2 ** _attempt
+                        log_tool_event(
+                            "Visit/Reader",
+                            "JinaFetchRetry",
+                            f"url={url} attempt={_attempt + 1}/{_max_retries} "
+                            f"error={str(exc)[:120]} retry_in={_wait}s",
+                            level="WARNING",
+                        )
+                        if _attempt < _max_retries - 1:
+                            await asyncio.sleep(_wait)
+                        continue
+
+                if response.status_code in (429, 503):
+                    _wait = 2 ** _attempt
+                    log_tool_event(
+                        "Visit/Reader",
+                        "JinaRateLimitRetry",
+                        f"url={url} attempt={_attempt + 1}/{_max_retries} "
+                        f"status={response.status_code} retry_in={_wait}s",
+                        level="WARNING",
+                    )
+                    if _attempt < _max_retries - 1:
+                        await asyncio.sleep(_wait)
+                    continue
+
+                break  # non-429/503 response — exit retry loop
+
+            if response is None or response.status_code != 200:
+                raise RuntimeError(
+                    f"Jina Reader API returned HTTP "
+                    f"{response.status_code if response else 'None'}: "
+                    f"{response.text[:200] if response else ''}"
                 )
-
-            response = await run_with_retries_async(
-                send_request, executor=self.executor
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(f"Reader API returned HTTP {response.status_code}")
 
             result = {
                 "content": response.text or "",
@@ -268,12 +307,26 @@ Example:
                 "meta": {
                     "provider": "jina",
                     "url": url,
-                    "reader_url": self.jina_reader_url,
+                    "reader_url": reader_url,
                 },
             }
 
         # Store result in cache only if we have valid content
         if result["content"].strip():
+            content_len = len(result["content"])
+            log_tool_event(
+                "Visit/Reader",
+                "FetchSuccess",
+                f"url={url} content_len={content_len}",
+                level="INFO",
+            )
+            if content_len < 2000:
+                log_tool_event(
+                    "Visit/Reader",
+                    "ShortContent",
+                    f"url={url} content_len={content_len} (may be low-quality)",
+                    level="WARNING",
+                )
             await set_cache_async(
                 "text_visit",
                 cache_key,
@@ -474,4 +527,16 @@ Example:
         summary_text = summary or ""
         evidence_preview = shorten_for_log(evidence_text)
         summary_preview = shorten_for_log(summary_text)
+        log_tool_event(
+            "Visit",
+            "Success",
+            (
+                f"url={url} "
+                f"evidence_len={len(evidence_text)} "
+                f"summary_len={len(summary_text)} "
+                f"evidence_preview={json.dumps(evidence_preview, ensure_ascii=False)} "
+                f"summary_preview={json.dumps(summary_preview, ensure_ascii=False)}"
+            ),
+            level="INFO",
+        )
         return useful_information

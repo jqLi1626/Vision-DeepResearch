@@ -1,0 +1,14 @@
+# Data folder - run data, results, and analysis (not tracked by git)
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Environment
+.env
+.venv
+
+# DS_Store
+.DS_Store
